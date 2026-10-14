@@ -1,0 +1,40 @@
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      CROPIQ_CONFIG: configs/default.yaml
+    volumes:
+      - ./artifacts:/app/artifacts:ro      # trained checkpoints produced by the training steps
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  dashboard:
+    build: .
+    command: ["streamlit", "run", "src/cropiq/dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports: ["8501:8501"]
+    environment:
+      CROPIQ_CONFIG: configs/default.yaml
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+    depends_on: [api]
+
+  # GPU training:  docker compose --profile train run --rm train python -m cropiq.training.train_classifier
+  # (requires the NVIDIA Container Toolkit; install CUDA torch wheels in a dedicated training image)
+  train:
+    profiles: ["train"]
+    build: .
+    working_dir: /app
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./data:/app/data:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,0 +1,52 @@
+# ---- Virtual environments & installs (the local "agro" folder is a venv) ----
+agro/
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+*.env
+.conda/
+node_modules/
+
+# ---- Python build / cache ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# ---- Data, models and experiment outputs (reproducible; never commit) ----
+data/
+artifacts/
+artifacts_smoke/
+mlruns/
+wandb/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.onnx
+
+# ---- Secrets & credentials ----
+*.pem
+*.key
+secrets.*
+.streamlit/secrets.toml
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

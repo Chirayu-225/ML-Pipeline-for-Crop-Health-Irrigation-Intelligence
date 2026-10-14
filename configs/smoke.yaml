@@ -1,0 +1,64 @@
+# CPU-only smoke configuration: tiny models, toy data, 1-3 epochs. Used by scripts/run_smoke_test.sh.
+_base_: default.yaml
+
+device: cpu
+
+paths:
+  data_root: artifacts_smoke/toy_plantvillage
+  manifest: artifacts_smoke/manifest.csv
+  runs_dir: artifacts_smoke/runs
+  synthetic_dir: artifacts_smoke/synthetic
+
+models:
+  classifier_ckpt: artifacts_smoke/runs/clf_synthetic/best.pt
+  vae_ckpt: artifacts_smoke/runs/vae/best.pt
+  snn_ckpt: artifacts_smoke/runs/snn/best.pt
+
+data:
+  image_size: 48
+  batch_size: 16
+  num_workers: 0
+  rare_keep_fraction: 0.4
+
+classifier:
+  backbone: small_cnn
+  pretrained: false
+  epochs: 3
+  amp: false
+  patience: 3
+  synthetic_max_per_class: 20
+
+diffusion:
+  image_size: 32
+  base_channels: 16
+  channel_mults: [1, 2]
+  num_res_blocks: 1
+  attn_resolutions: []
+  timesteps: 100
+  epochs: 2
+  batch_size: 16
+  amp: false
+  sample_every: 1
+  generation:
+    n_per_class: 6
+    ddim_steps: 5
+    teacher_min_prob: 0.0
+    near_duplicate_sim: 1.01
+
+vae:
+  latent_dim: 32
+  base_channels: 16
+  epochs: 3
+  batch_size: 16
+  amp: false
+
+sensors:
+  fields_train: 8
+  fields_val: 2
+  fields_test: 2
+  days_per_field: 60
+
+snn:
+  hidden: 32
+  epochs: 3
+  batch_size: 64

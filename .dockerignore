@@ -1,0 +1,11 @@
+.git
+data/
+artifacts/
+artifacts_smoke/
+__pycache__/
+*.pyc
+.pytest_cache/
+mlruns/
+wandb/
+tests/
+docs/

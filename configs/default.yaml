@@ -1,0 +1,121 @@
+# Default configuration, sized for a 4 GB VRAM GPU (e.g. RTX 3050 Ti) with mixed precision.
+seed: 42
+device: auto            # auto | cpu | cuda
+
+paths:
+  data_root: data/plantvillage          # folder containing the PlantVillage class folders (any nesting)
+  manifest: artifacts/manifest.csv      # produced by scripts/prepare_data.py
+  runs_dir: artifacts/runs
+  synthetic_dir: artifacts/synthetic    # diffusion output (never mixed into val/test)
+  sensor_csv: null                      # AgriSense-style CSV; null -> use the built-in simulator
+
+models:                                 # checkpoints used by the API / dashboard
+  classifier_ckpt: artifacts/runs/clf_synthetic/best.pt
+  vae_ckpt: artifacts/runs/vae/best.pt
+  snn_ckpt: artifacts/runs/snn/best.pt
+
+data:
+  crop: tomato                          # tomato | all
+  variant: color                        # PlantVillage variant folder: color | grayscale | segmented
+  image_size: 128                       # classifier + VAE resolution
+  split: {train: 0.70, val: 0.15, test: 0.15}
+  batch_size: 32
+  num_workers: 2
+  # Controlled low-data experiment: keep only this fraction of TRAIN images of the rare classes.
+  # (Names are normalised: 'Tomato___Early_blight' == 'early_blight'.)
+  rare_classes: [tomato_mosaic_virus, leaf_mold, early_blight]
+  rare_keep_fraction: 0.15
+  # Open-set experiment: classes removed from classifier training/validation to act as "unknown diseases".
+  holdout_classes: []
+
+severity:                               # proxy labels from lesion-area fraction (see docs/MODEL_CARD.md)
+  mild_max: 0.08
+  moderate_max: 0.25
+
+tracking:
+  backend: none                         # none | mlflow | wandb
+  experiment: crop-health-irrigation
+
+classifier:
+  backbone: resnet18                    # resnet18 | small_cnn
+  pretrained: true
+  epochs: 20
+  lr: 0.0005
+  weight_decay: 0.0001
+  label_smoothing: 0.05
+  severity_loss_weight: 0.3
+  amp: true
+  patience: 5
+  downscale_aug_p: 0.5                  # mimic the blur of up-sampled diffusion images (anti-shortcut)
+  synthetic_max_per_class: 600
+
+diffusion:
+  image_size: 64
+  base_channels: 64
+  channel_mults: [1, 2, 3, 4]
+  num_res_blocks: 2
+  attn_resolutions: [16, 8]
+  timesteps: 1000
+  schedule: cosine
+  epochs: 150
+  batch_size: 16                        # x grad_accum = effective batch 32 (fits 4 GB with AMP)
+  grad_accum: 2
+  lr: 0.0002
+  ema_decay: 0.999
+  p_uncond: 0.1                         # classifier-free-guidance label dropout
+  amp: true
+  sample_every: 25
+  generation:
+    n_per_class: 400
+    ddim_steps: 50
+    guidance_scale: 3.0
+    teacher_min_prob: 0.7               # keep a synthetic image only if the real-only teacher agrees
+    near_duplicate_sim: 0.995           # drop images nearly identical to a real training image
+
+vae:
+  latent_dim: 128
+  base_channels: 32
+  epochs: 60
+  batch_size: 64
+  lr: 0.001
+  recon_sigma: 0.1                      # Gaussian decoder std -> reconstruction/KL balance
+  kl_warmup_epochs: 10
+  score: topk                           # topk | mean   (topk = mean of the worst `topk_frac` pixels)
+  topk_frac: 0.10
+  threshold_percentile: 95              # of healthy-validation scores -> ~5% false-alarm rate
+  amp: true
+
+sensors:                                # simulator + SNN data (hourly readings)
+  window_hours: 24
+  stride_hours: 3
+  fields_train: 28
+  fields_val: 6
+  fields_test: 6
+  days_per_field: 120
+  noise_std: {soil_moisture: 1.0, temperature: 0.4, humidity: 2.0}
+  irrigate_threshold: 30.0              # % volumetric water content
+  wilting_point: 18.0
+  ranges: {soil_moisture: [0, 60], temperature: [5, 45], humidity: [10, 100]}
+
+snn:
+  backend: snntorch                     # snntorch | native
+  hidden: 64
+  beta: 0.9
+  beta_out: 0.95
+  threshold: 1.0
+  surrogate_slope: 25.0
+  pop_neurons: 16                       # population-coding neurons per feature
+  weight_gain: 1.0                      # scale of the initial hidden-layer weights
+  readout_frac: 0.25                    # readout averages the leaky-integrator membrane over the last 25% of steps
+  sub_steps: 4                          # spike-train sub-steps per hourly reading
+  delta_gain: 25.0                      # sensitivity of the UP/DOWN change neurons (key for fault/rain detection)
+  epochs: 30
+  batch_size: 128
+  lr: 0.002
+  class_weight_power: 1.0               # 1 = full inverse-frequency weights (recall on the rare 'alert' class)
+  seed_inference: 0
+
+advisory:
+  min_confidence: 0.60                  # below this the disease prediction is treated as uncertain
+  humid_rh: 85
+  actions: [wait, irrigate, alert]
