@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from cropiq.config import base_parser, load_config
-from cropiq.data.datasets import LeafDataset, build_transform, load_frames
+from cropiq.data.datasets import LeafDataset, build_transform, load_frames, rare_signature
 from cropiq.data.severity import lesion_fraction, severity_from_fraction
 from cropiq.models.loading import load_classifier, load_ddpm
 from cropiq.utils import ensure_dir, get_device, get_logger, match_label, save_json, seed_everything
@@ -62,11 +62,19 @@ def main() -> None:
     model, diffusion, ck = load_ddpm(ddpm_path, device)
     if ck["class_names"] != names:
         raise SystemExit("DDPM was trained with different classes than the current config/manifest.")
+    signature = rare_signature(frames)
+    if ck.get("rare_signature") not in (None, signature):
+        raise SystemExit(
+            f"DDPM was trained on a different rare-class subset ({ck['rare_signature']}) than the current config "
+            f"({signature}, keep {cfg.data.rare_keep_fraction}). Retrain the DDPM for this keep-fraction."
+        )
     gen = torch.Generator(device=device).manual_seed(cfg.seed)
 
     teacher, real_feats = None, None
     if args.teacher:
-        teacher, _ = load_classifier(args.teacher, device)
+        teacher, tck = load_classifier(args.teacher, device)
+        if tck.get("rare_signature") not in (None, signature):
+            raise SystemExit("The teacher classifier was trained on a different rare-class subset; retrain it first.")
         real_feats = extract_features(teacher, frames.train, c2i, size, device)
         log.info("Teacher gate on (min prob %.2f); %d real train features cached", g.teacher_min_prob, len(real_feats))
     else:
@@ -119,6 +127,8 @@ def main() -> None:
         log.info("%-30s kept %4d / tried %4d (teacher-rejected %d, duplicate-rejected %d)", cls, kept, tried, rejected_teacher, rejected_dup)
 
     pd.DataFrame(rows).to_csv(out_root / "manifest.csv", index=False)
+    report["_meta"] = {"rare_signature": signature, "rare_keep_fraction": float(cfg.data.rare_keep_fraction),
+                       "teacher_gate": bool(args.teacher), "ddpm": ddpm_path}
     save_json(report, out_root / "generation_report.json")
     log.info("Wrote %d synthetic images to %s", len(rows), out_root)
 

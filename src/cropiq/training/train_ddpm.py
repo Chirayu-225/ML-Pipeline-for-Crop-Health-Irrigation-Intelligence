@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 
 from cropiq.config import base_parser, load_config
-from cropiq.data.datasets import RawImageDataset, load_frames
+from cropiq.data.datasets import RawImageDataset, load_frames, rare_signature
 from cropiq.models.ddpm import EMA, GaussianDiffusion, build_unet
 from cropiq.utils import Tracker, count_params, ensure_dir, get_device, get_logger, load_checkpoint, save_checkpoint, seed_everything
 
@@ -48,7 +48,8 @@ def main() -> None:
     ds = RawImageDataset(frames.train, frames.class_to_idx, d.image_size, augment=True, value_range="-11")
     accum = int(d.get("grad_accum", 1))
     loader = DataLoader(ds, d.batch_size, shuffle=True, drop_last=True, num_workers=0, pin_memory=device.type == "cuda")
-    log.info("DDPM training images: %d across %d classes", len(ds), len(names))
+    log.info("DDPM training images: %d across %d classes | rare subset %s (keep %.3f)", len(ds), len(names),
+             rare_signature(frames), cfg.data.rare_keep_fraction)
 
     model = build_unet(cfg, len(names)).to(device)
     ema = EMA(model, d.ema_decay)
@@ -96,6 +97,8 @@ def main() -> None:
             opt_state=opt.state_dict(),
             epoch=epoch,
             class_names=names,
+            rare_signature=rare_signature(frames),
+            rare_keep_fraction=float(cfg.data.rare_keep_fraction),
             timesteps=d.timesteps,
             schedule=d.schedule,
             unet=dict(

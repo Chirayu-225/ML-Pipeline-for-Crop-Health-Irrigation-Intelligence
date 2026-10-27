@@ -9,6 +9,7 @@ Three runs make up the augmentation ablation (all evaluated on the SAME real, un
 from __future__ import annotations
 
 import copy
+import json
 import time
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader
 
 from cropiq.config import base_parser, load_config
-from cropiq.data.datasets import IGNORE, LeafDataset, build_transform, class_counts, load_frames, make_sampler
+from cropiq.data.datasets import IGNORE, LeafDataset, build_transform, class_counts, load_frames, make_sampler, rare_signature
 from cropiq.evaluation.metrics import classification_summary, fit_temperature, plot_confusion, softmax_np
 from cropiq.models.classifier import LeafClassifier
 from cropiq.utils import (
@@ -68,6 +69,13 @@ def main() -> None:
 
     frames = load_frames(cfg, with_synthetic=args.use_synthetic)
     names, c2i = frames.class_names, frames.class_to_idx
+    signature = rare_signature(frames)
+    if args.use_synthetic:
+        report_path = Path(cfg.paths.synthetic_dir) / "generation_report.json"
+        syn_sig = json.loads(report_path.read_text()).get("_meta", {}).get("rare_signature") if report_path.exists() else None
+        if syn_sig not in (None, signature):
+            raise SystemExit(f"Synthetic images in {cfg.paths.synthetic_dir} were made from a different rare subset "
+                             f"({syn_sig} vs {signature}); regenerate them for this keep-fraction.")
     counts = dict(zip(names, class_counts(frames.train, names).tolist()))
     log.info("Train class counts: %s", counts)
 
@@ -139,6 +147,10 @@ def main() -> None:
     )
     metrics = {
         "run": args.run_name,
+        "seed": int(cfg.seed),
+        "rare_keep_fraction": float(cfg.data.rare_keep_fraction),
+        "rare_signature": signature,
+        "synthetic_dir": str(cfg.paths.synthetic_dir) if args.use_synthetic else None,
         "use_synthetic": args.use_synthetic,
         "balanced_sampler": args.balanced_sampler,
         "train_class_counts": counts,
@@ -156,6 +168,7 @@ def main() -> None:
         image_size=size,
         temperature=temperature,
         severity_names=["mild", "moderate", "severe"],
+        rare_signature=signature,
     )
     tracker.log({"test_macro_f1": summary["macro_f1"], "test_ece": summary["ece"]})
     tracker.finish()

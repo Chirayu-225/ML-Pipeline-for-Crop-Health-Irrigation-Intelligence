@@ -23,8 +23,11 @@ data:
   num_workers: 2
   # Controlled low-data experiment: keep only this fraction of TRAIN images of the rare classes.
   # (Names are normalised: 'Tomato___Early_blight' == 'early_blight'.)
+  # 0.05 = roughly 10-60 images per rare class: low enough that a pretrained ResNet is not already at its
+  # ceiling, so augmentation has room to show (or fail to show) a difference.
   rare_classes: [tomato_mosaic_virus, leaf_mold, early_blight]
-  rare_keep_fraction: 0.15
+  rare_keep_fraction: 0.05
+  rare_seed: 0                          # fixes WHICH rare images are kept, independent of `seed` (nested subsets)
   # Open-set experiment: classes removed from classifier training/validation to act as "unknown diseases".
   holdout_classes: []
 

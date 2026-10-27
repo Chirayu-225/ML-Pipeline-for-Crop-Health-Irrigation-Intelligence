@@ -26,7 +26,8 @@ dist/
 htmlcov/
 
 # ---- Data, models and experiment outputs (reproducible; never commit) ----
-data/
+# repo-root dataset folder only (a bare 'data/' would also hide src/cropiq/data)
+/data/
 artifacts/
 artifacts_smoke/
 mlruns/

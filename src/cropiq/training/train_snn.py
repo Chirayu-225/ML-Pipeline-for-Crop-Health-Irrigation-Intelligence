@@ -2,9 +2,12 @@
 
     python -m cropiq.training.train_snn
 
-Reports macro-F1 / per-class recall on held-out FIELDS, robustness to extra sensor noise, spike sparsity and
-an energy *proxy* versus the GRU. The labels come from an agronomic rule policy (see data/sensors.py), so
-read the numbers as "policy imitation under noisy, faulty sensors", not as field-validated agronomy.
+Reports, for the SNN, a GRU, the observed-values threshold rule and a small decision tree, all on the SAME
+held-out-field windows: macro-F1, per-class recall (alert recall is the safety-critical headline), robustness
+to extra sensor noise, and measured CPU latency per decision. The op-count energy proxy is kept, but it only
+describes neuromorphic hardware: on a CPU / Raspberry Pi the measured latency is the relevant cost.
+The labels come from an agronomic rule policy (see data/sensors.py), so read the numbers as
+"policy imitation under noisy, faulty sensors", not as field-validated agronomy.
 """
 from __future__ import annotations
 
@@ -18,7 +21,9 @@ import torch.nn.functional as F
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
 from cropiq.config import base_parser, load_config
-from cropiq.data.sensors import ACTIONS, FEATURES, build_sensor_splits, normalize
+from cropiq.data.sensors import ACTIONS, FEATURES, build_sensor_splits, normalize, observed_rule_label
+from cropiq.edge.export_snn import EdgeSNN
+from cropiq.evaluation.sensor_baselines import fit_tree, handcrafted_features, latency_ms, rule_predict
 from cropiq.evaluation.metrics import plot_confusion
 from cropiq.models.snn import GRUBaseline, build_snn, gru_cost, snn_cost
 from cropiq.utils import Tracker, count_params, ensure_dir, get_device, get_logger, save_checkpoint, save_json, seed_everything
@@ -122,13 +127,6 @@ def main() -> None:
     test = eval_snn(model, enc, xn["test"], y["test"], device, seed=2, with_stats=True)
     report = classification_report(y["test"], test["pred"], labels=[0, 1, 2], target_names=ACTIONS, output_dict=True, zero_division=0)
     plot_confusion(y["test"], test["pred"], ACTIONS, run_dir / "confusion_matrix.png")
-    rng = np.random.default_rng(0)
-    robustness = {}
-    for mult in (1.0, 2.0, 3.0):
-        sigma = np.array([sc.noise_std[f] for f in FEATURES], dtype=np.float32) * mult
-        noisy = splits["test"][0] + rng.normal(0, 1, splits["test"][0].shape).astype(np.float32) * sigma
-        r = eval_snn(model, enc, torch.from_numpy(normalize(noisy, ranges)), y["test"], device, seed=3)
-        robustness[f"extra_noise_x{mult:g}"] = r["macro_f1"]
 
     # ---------------------------- GRU baseline on identical data ------------------------------
     mu, sd = xn["train"].mean((0, 1)), xn["train"].std((0, 1)).clamp(min=1e-3)  # z-score: a fair, well-conditioned baseline
@@ -152,22 +150,112 @@ def main() -> None:
     gtest = eval_gru(gru, zn["test"], y["test"], device)
     g_report = classification_report(y["test"], gtest["pred"], labels=[0, 1, 2], target_names=ACTIONS, output_dict=True, zero_division=0)
 
+    # ---------------------------- non-learned / classical baselines on identical windows --------------
+    X_train_phys, X_test_phys = splits["train"][0], splits["test"][0]
+    rule_pred = rule_predict(X_test_phys, cfg)
+    tree = fit_tree(X_train_phys, y["train"], seed=cfg.seed)
+    tree_pred = tree.predict(handcrafted_features(X_test_phys))
+    # Same tree, trained on the clean windows plus noisier copies (x1, x2, x3 the simulator's sensor noise).
+    # Labels are unchanged: they come from the hidden true state, so extra observation noise does not alter them.
+    aug_rng = np.random.default_rng(cfg.seed + 1)
+    base_sigma = np.array([sc.noise_std[f] for f in FEATURES], dtype=np.float32)
+    aug_X = [X_train_phys] + [X_train_phys + aug_rng.normal(0, 1, X_train_phys.shape).astype(np.float32) * base_sigma * m
+                              for m in (1.0, 2.0, 3.0)]
+    tree_aug = fit_tree(np.concatenate(aug_X), np.tile(y["train"], len(aug_X)), seed=cfg.seed)
+    tree_aug_pred = tree_aug.predict(handcrafted_features(X_test_phys))
+
+    def summarise(pred: np.ndarray) -> dict:
+        rep_ = classification_report(y["test"], pred, labels=[0, 1, 2], target_names=ACTIONS, output_dict=True, zero_division=0)
+        return {
+            "test_macro_f1": float(f1_score(y["test"], pred, average="macro", labels=[0, 1, 2], zero_division=0)),
+            "per_class": {a: {k: rep_[a][k] for k in ("precision", "recall", "f1-score", "support")} for a in ACTIONS},
+        }
+
+    # ---------------------------- robustness: the SAME noisy test windows for every model -------------
+    rng = np.random.default_rng(0)
+    robustness = {m: {} for m in ("snn", "gru", "rule", "tree", "tree_noiseaug")}
+    for mult in (1.0, 2.0, 3.0):
+        sigma = np.array([sc.noise_std[f] for f in FEATURES], dtype=np.float32) * mult
+        noisy = X_test_phys + rng.normal(0, 1, X_test_phys.shape).astype(np.float32) * sigma
+        noisy_n = torch.from_numpy(normalize(noisy, ranges))
+        key = f"extra_noise_x{mult:g}"
+        f1 = lambda p: float(f1_score(y["test"], p, average="macro", labels=[0, 1, 2], zero_division=0))  # noqa: E731
+        robustness["snn"][key] = eval_snn(model, enc, noisy_n, y["test"], device, seed=3)["macro_f1"]
+        robustness["gru"][key] = eval_gru(gru, (noisy_n - mu) / sd, y["test"], device)["macro_f1"]
+        robustness["rule"][key] = f1(rule_predict(noisy, cfg))
+        robustness["tree"][key] = f1(tree.predict(handcrafted_features(noisy)))
+        robustness["tree_noiseaug"][key] = f1(tree_aug.predict(handcrafted_features(noisy)))
+
+    # ---------------------------- measured CPU latency per decision (batch size 1, one thread) ---------
+    n_lat = min(200, len(X_test_phys))
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    snn_cpu, gru_cpu = copy.deepcopy(model).cpu().eval(), copy.deepcopy(gru).cpu().eval()
+    sd_np = {k: v.detach().cpu().numpy() for k, v in snn_cpu.state_dict().items()}
+    edge = EdgeSNN(
+        {"w1": sd_np["fc1.weight"], "b1": sd_np["fc1.bias"], "w2": sd_np["fc2.weight"], "b2": sd_np["fc2.bias"],
+         "w3": sd_np["fc3.weight"], "b3": sd_np["fc3.bias"]},
+        {"hyper": {"beta": s.beta, "beta_out": s.beta_out, "threshold": s.threshold, "readout_frac": s.get("readout_frac", 0.25)},
+         "encoder": {"pop": s.pop_neurons, "sub_steps": s.sub_steps, "delta_gain": s.delta_gain},
+         "ranges": ranges, "actions": ACTIONS, "window_hours": sc.window_hours},
+    )
+    lat_gen = torch.Generator().manual_seed(0)
+    xn_cpu, zn_cpu = xn["test"][:n_lat], zn["test"][:n_lat].cpu()
+    with torch.no_grad():
+        latency = {
+            "snn_torch_1draw": latency_ms(lambda i: snn_cpu(enc(xn_cpu[i : i + 1], lat_gen)), list(range(n_lat))),
+            "snn_numpy_edge_5draws": latency_ms(lambda w: edge.predict(w, n_draws=5), list(X_test_phys[:n_lat])),
+            "gru_torch": latency_ms(lambda i: gru_cpu(zn_cpu[i : i + 1]), list(range(n_lat))),
+            "rule": latency_ms(lambda w: observed_rule_label(w, cfg), list(X_test_phys[:n_lat])),
+            "tree": latency_ms(lambda w: tree.predict(handcrafted_features(w[None])), list(X_test_phys[:n_lat])),
+            "tree_noiseaug": latency_ms(lambda w: tree_aug.predict(handcrafted_features(w[None])), list(X_test_phys[:n_lat])),
+        }
+    torch.set_num_threads(threads)
+
+    snn_proxy = snn_cost(test["mean_stats"], enc.n_channels, s.hidden, 3)
+    snn_proxy["encoder_random_draws"] = int(test["mean_stats"]["steps"] * enc.n_channels)
+    rule_s, tree_s, tree_aug_s = summarise(rule_pred), summarise(tree_pred), summarise(tree_aug_pred)
+    summary = {
+        name: {
+            "macro_f1": round(m1, 4),
+            "alert_recall": round(rec, 4),
+            "macro_f1_noise_x3": round(robustness[key]["extra_noise_x3"], 4),
+            "latency_median_ms": round(latency[lat]["median_ms"], 4),
+        }
+        for name, key, m1, rec, lat in [
+            ("snn", "snn", test["macro_f1"], report["alert"]["recall"], "snn_torch_1draw"),
+            ("gru", "gru", gtest["macro_f1"], g_report["alert"]["recall"], "gru_torch"),
+            ("rule", "rule", rule_s["test_macro_f1"], rule_s["per_class"]["alert"]["recall"], "rule"),
+            ("tree", "tree", tree_s["test_macro_f1"], tree_s["per_class"]["alert"]["recall"], "tree"),
+            ("tree_noiseaug", "tree_noiseaug", tree_aug_s["test_macro_f1"], tree_aug_s["per_class"]["alert"]["recall"], "tree_noiseaug"),
+        ]
+    }
     metrics = {
         "snn": {
             "test_macro_f1": test["macro_f1"],
             "per_class": {a: {k: report[a][k] for k in ("precision", "recall", "f1-score", "support")} for a in ACTIONS},
-            "robustness_macro_f1": robustness,
+            "robustness_macro_f1": robustness["snn"],
             "mean_spikes_per_decision": test["mean_stats"],
-            "cost_proxy": snn_cost(test["mean_stats"], enc.n_channels, s.hidden, 3),
+            "cost_proxy": snn_proxy,
             "params": count_params(model),
         },
         "gru_baseline": {
             "test_macro_f1": gtest["macro_f1"],
             "per_class": {a: {k: g_report[a][k] for k in ("precision", "recall", "f1-score", "support")} for a in ACTIONS},
+            "robustness_macro_f1": robustness["gru"],
             "cost_proxy": gru_cost(sc.window_hours, len(FEATURES), 32, 3),
             "params": count_params(gru),
         },
-        "note": "Labels come from a rule policy on hidden simulator state; cost numbers are a 45nm op-count proxy, not hardware measurements.",
+        "rule_baseline": {**summarise(rule_pred), "robustness_macro_f1": robustness["rule"]},
+        "tree_baseline": {**summarise(tree_pred), "robustness_macro_f1": robustness["tree"],
+                          "depth": int(tree.get_depth()), "leaves": int(tree.get_n_leaves())},
+        "tree_noiseaug_baseline": {**tree_aug_s, "robustness_macro_f1": robustness["tree_noiseaug"],
+                                   "depth": int(tree_aug.get_depth()), "leaves": int(tree_aug.get_n_leaves())},
+        "latency_cpu_1thread": latency,
+        "summary": summary,
+        "note": ("Labels come from a rule policy on hidden simulator state. cost_proxy is a 45 nm op-count model that only "
+                 "applies to neuromorphic hardware (spike = accumulate) and ignores the encoder's random draws; on a CPU "
+                 "use latency_cpu_1thread, measured with batch size 1 on one thread."),
     }
     save_json(metrics, run_dir / "metrics.json")
     save_checkpoint(
@@ -182,8 +270,12 @@ def main() -> None:
         window_hours=sc.window_hours,
     )
     tracker.finish()
-    log.info("TEST macro-F1 SNN %.4f | GRU %.4f | alert recall SNN %.3f | noise robustness %s", test["macro_f1"], gtest["macro_f1"], report["alert"]["recall"], robustness)
-    log.info("Energy proxy per decision: SNN %.1f nJ vs GRU %.1f nJ", metrics["snn"]["cost_proxy"]["energy_nj"], metrics["gru_baseline"]["cost_proxy"]["energy_nj"])
+    log.info("%-13s %9s %13s %15s %12s", "model", "macro-F1", "ALERT recall", "F1 @ noise x3", "CPU ms/dec")
+    for name, m in summary.items():
+        log.info("%-13s %9.4f %13.3f %15.4f %12.3f", name, m["macro_f1"], m["alert_recall"], m["macro_f1_noise_x3"], m["latency_median_ms"])
+    log.info("NumPy edge SNN (5 draws, as served): %.3f ms/decision", latency["snn_numpy_edge_5draws"]["median_ms"])
+    log.info("Energy proxy (neuromorphic-hardware assumption only): SNN %.1f nJ vs GRU %.1f nJ",
+             snn_proxy["energy_nj"], metrics["gru_baseline"]["cost_proxy"]["energy_nj"])
 
 
 if __name__ == "__main__":
